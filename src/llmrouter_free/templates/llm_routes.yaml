@@ -1,0 +1,100 @@
+# llmrouter-free starter config.
+#
+# A ROUTE is an ordered list of DEPLOYMENTS. For every call the router walks the list and uses the first
+# deployment that is currently usable, failing over down the list on errors, rate limits and bad output.
+# Model ids use LiteLLM's "<provider>/<model>" convention. A deployment whose `api_key_env` variable is unset
+# is skipped (so this file is safe to keep even if you only have some of the keys). Put keys in .env.
+
+deployments:
+  # ---- fields every deployment can set -------------------------------------------------------------------
+  #   name            unique id, referenced from `routes` below
+  #   model           LiteLLM model id
+  #   api_key_env     NAME of the environment variable holding the key (never the key itself)
+  #   tier            free (default) | paid. Paid deployments are only used if allow_paid=True and the daily
+  #                   budget (max_usd_per_day) is not spent; they need cost_per_mtok_in / cost_per_mtok_out
+  #   family          model family, so a "judge" call can exclude the generator's family (exclude_families=)
+  #   rate_group      deployments drawing on ONE provider budget share rpm/rpd windows and 429 cooldowns
+  #   rpm / rpd       requests per minute / per day (omit = unlimited on our side; the provider may still 429)
+  #   api_base        override the provider's default endpoint (local servers, proxies)
+  #   extra_body      passed through verbatim to the provider, e.g. {reasoning: {enabled: false}}
+  #   min_max_tokens  floor on the requested max_tokens (reasoning models that spend budget thinking)
+  #   temperature     overrides the caller's temperature for this deployment only
+  #   tags            free-form labels (documentation only)
+
+  # OpenRouter free models. `reasoning: {enabled: false}` matters: a reasoning model can burn nearly its whole
+  # output budget on hidden thinking tokens and truncate the actual answer (seen live: 14,488 of 15,000).
+  - name: openrouter-nemotron-super
+    model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+    api_key_env: OPENROUTER_API_KEY
+    family: nemotron
+    extra_body: {reasoning: {enabled: false}}
+
+  - name: openrouter-glm
+    model: openrouter/z-ai/glm-5.2:free
+    api_key_env: OPENROUTER_API_KEY
+    family: glm
+    extra_body: {reasoning: {enabled: false}}
+
+  - name: openrouter-qwen
+    model: openrouter/qwen/qwen3.8-27b:free
+    api_key_env: OPENROUTER_API_KEY
+    family: qwen
+    extra_body: {reasoning: {enabled: false}}
+
+  # Groq: a different family (gpt-oss), useful as an independent judge.
+  - name: groq-gpt-oss
+    model: groq/openai/gpt-oss-120b
+    api_key_env: GROQ_API_KEY
+    family: gpt-oss
+    rpm: 30
+
+  - name: cerebras-qwen
+    model: cerebras/qwen-3-32b
+    api_key_env: CEREBRAS_API_KEY
+    family: qwen
+    rpm: 30
+    rpd: 14400
+
+  # Mistral: every model in one workspace shares ONE budget, hence the shared rate_group.
+  - name: mistral-small
+    model: mistral/mistral-small-latest
+    api_key_env: MISTRAL_API_KEY
+    family: mistral
+    rate_group: mistral-workspace
+    rpm: 20
+
+  # Local Ollama: no key and no rate limit, the reliability fallback. `api_key_env` just needs SOME set value
+  # for the deployment to count as enabled (OLLAMA_API_KEY=anything in .env). `think: false` turns off a
+  # thinking model's reasoning, which otherwise eats the token budget or times out.
+  - name: ollama-local
+    model: ollama_chat/gemma4:e4b
+    api_key_env: OLLAMA_API_KEY
+    api_base: http://localhost:11434
+    family: gemma4
+    extra_body: {think: false}
+
+  # A paid deployment, only used when allow_paid=True and under the daily budget.
+  # - name: claude-sonnet
+  #   model: anthropic/claude-sonnet-5
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   tier: paid
+  #   family: claude
+  #   cost_per_mtok_in: 3.0
+  #   cost_per_mtok_out: 15.0
+
+# Route name -> deployments in preference order. Name routes after the TASK, not the model.
+routes:
+  default: [openrouter-nemotron-super, openrouter-glm, openrouter-qwen, ollama-local]
+  fast:    [groq-gpt-oss, cerebras-qwen, ollama-local]
+  # A judge must not share a family with the generator it grades; pass exclude_families=["nemotron"] at call time.
+  judge:   [groq-gpt-oss, openrouter-glm, ollama-local]
+
+cooldown:
+  rate_limit_seconds: 60        # after a 429: the deployment's whole rate_group sits out this long
+  daily_quota_seconds: 86400    # provider says the daily quota is exhausted: sit out 24 h
+  error_seconds: 30             # transient 5xx / timeout: this one deployment sits out
+
+max_attempts_per_call: 10       # hard cap on attempts for one complete() call across all deployments
+max_attempts_per_deployment: 3  # transient error/invalid_output: retry the SAME deployment this often before moving on
+max_cloud_attempts: 2           # if the route has a local (ollama) fallback: switch to it after this many cloud attempts
+request_timeout_seconds: 150    # per-HTTP-request cap
